@@ -1,0 +1,18 @@
+{
+  "name": "nofluff-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NoFluff backend API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --env-file=.env server.js",
+    "dev": "node --watch --env-file=.env server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "google-auth-library": "^11.3.4",
+    "mongodb": "^7.9.0"
+  }
+}
