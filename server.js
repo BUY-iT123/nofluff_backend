@@ -317,7 +317,7 @@ async function start() {
   usageCollection = client.db(databaseName).collection("daily_usage");
   usersCollection = client.db(databaseName).collection("users");
   await usersCollection.createIndex({ googleId: 1 }, { unique: true, partialFilterExpression: { googleId: { $type: "string" } } });
-  app.listen(port, "127.0.0.1", () => {
+  app.listen(port, "0.0.0.0", () => {
     console.log(`NoFluff local API listening on http://127.0.0.1:${port}; MongoDB connected.`);
   });
 }
@@ -336,4 +336,5 @@ start().catch(async (error) => {
   await client.close().catch(() => {});
   process.exit(1);
 });
+
 
