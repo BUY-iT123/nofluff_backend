@@ -81,9 +81,7 @@ function currentDayKey() {
 }
 
 function personKey(req) {
-  return req.user?.id
-    ? `user_${req.user.id}`
-    : crypto.createHash("sha256").update(`ip:${req.ip || "local"}`).digest("hex");
+  return `user_${req.user.id}`;
 }
 
 async function readUsage(day, key) {
@@ -218,6 +216,7 @@ app.post("/api/auth/logout", (_req, res) => {
 });
 
 app.get("/api/usage", async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: "Sign in with Google to use your daily rewrite requests." });
   try {
     const usage = await readUsage(currentDayKey(), personKey(req));
     res.json(usage);
@@ -228,6 +227,7 @@ app.get("/api/usage", async (req, res) => {
 });
 
 app.post("/api/rewrite", async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: "Sign in with Google to use your daily rewrite requests." });
   const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
   if (!text) return res.status(400).json({ error: "Please paste some text first." });
 
@@ -336,5 +336,6 @@ start().catch(async (error) => {
   await client.close().catch(() => {});
   process.exit(1);
 });
+
 
 
