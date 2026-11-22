@@ -34,6 +34,7 @@ const client = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 10000 });
 const googleVerifier = new OAuth2Client();
 let usageCollection;
 let usersCollection;
+let projectsCollection;
 
 function readSession(req) {
   const cookie = req.headers.cookie?.split(";").map((part) => part.trim()).find((part) => part.startsWith("nofluff_session="));
@@ -215,6 +216,88 @@ app.post("/api/auth/logout", (_req, res) => {
   res.json({ ok: true });
 });
 
+function projectResponse(project) {
+  return {
+    id: project._id.toString(),
+    title: project.title,
+    conversation: project.conversation,
+    createdAt: project.createdAt,
+    updatedAt: project.updatedAt,
+  };
+}
+
+function validConversation(conversation) {
+  return conversation
+    && typeof conversation === "object"
+    && typeof conversation.original === "string"
+    && conversation.original.length > 0
+    && conversation.original.length <= 10000
+    && conversation.result
+    && typeof conversation.result.text === "string"
+    && Array.isArray(conversation.result.segs)
+    && Array.isArray(conversation.followUps ?? []);
+}
+
+app.get("/api/projects", async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: "Sign in with Google to see your saved writing." });
+  try {
+    const projects = await projectsCollection
+      .find({ ownerId: new ObjectId(req.user.id) })
+      .sort({ updatedAt: -1 })
+      .limit(100)
+      .toArray();
+    return res.json({ projects: projects.map(projectResponse) });
+  } catch (error) {
+    console.error("Could not load saved projects:", error.name);
+    return res.status(503).json({ error: "Your saved writing could not be loaded. Please try again." });
+  }
+});
+
+app.post("/api/projects", async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: "Sign in with Google to save your writing." });
+  if (!validConversation(req.body?.conversation)) {
+    return res.status(400).json({ error: "This writing could not be saved. Please try again." });
+  }
+  try {
+    const now = new Date();
+    const project = {
+      ownerId: new ObjectId(req.user.id),
+      title: typeof req.body.title === "string" ? req.body.title.trim().slice(0, 120) : "",
+      conversation: req.body.conversation,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const result = await projectsCollection.insertOne(project);
+    return res.status(201).json({ project: projectResponse({ ...project, _id: result.insertedId }) });
+  } catch (error) {
+    console.error("Could not save project:", error.name);
+    return res.status(503).json({ error: "Your writing could not be saved. Please try again." });
+  }
+});
+
+app.put("/api/projects/:id", async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: "Sign in with Google to save your writing." });
+  if (!ObjectId.isValid(req.params.id) || !validConversation(req.body?.conversation)) {
+    return res.status(400).json({ error: "This writing could not be saved. Please try again." });
+  }
+  try {
+    const filter = { _id: new ObjectId(req.params.id), ownerId: new ObjectId(req.user.id) };
+    const result = await projectsCollection.updateOne(filter, {
+      $set: {
+        title: typeof req.body.title === "string" ? req.body.title.trim().slice(0, 120) : "",
+        conversation: req.body.conversation,
+        updatedAt: new Date(),
+      },
+    });
+    if (!result.matchedCount) return res.status(404).json({ error: "That saved project could not be found." });
+    const project = await projectsCollection.findOne(filter);
+    return res.json({ project: projectResponse(project) });
+  } catch (error) {
+    console.error("Could not update saved project:", error.name);
+    return res.status(503).json({ error: "Your writing could not be saved. Please try again." });
+  }
+});
+
 app.get("/api/usage", async (req, res) => {
   if (!req.user) return res.status(401).json({ error: "Sign in with Google to use your daily rewrite requests." });
   try {
@@ -316,7 +399,9 @@ async function start() {
   await client.db("admin").command({ ping: 1 });
   usageCollection = client.db(databaseName).collection("daily_usage");
   usersCollection = client.db(databaseName).collection("users");
+  projectsCollection = client.db(databaseName).collection("projects");
   await usersCollection.createIndex({ googleId: 1 }, { unique: true, partialFilterExpression: { googleId: { $type: "string" } } });
+  await projectsCollection.createIndex({ ownerId: 1, updatedAt: -1 });
   app.listen(port, "0.0.0.0", () => {
     console.log(`NoFluff local API listening on http://127.0.0.1:${port}; MongoDB connected.`);
   });
