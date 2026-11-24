@@ -5,6 +5,7 @@ const express = require("express");
 const cors = require("cors");
 const { MongoClient, ObjectId } = require("mongodb");
 const { OAuth2Client } = require("google-auth-library");
+const { validatePostReadyText } = require("./post-ready-utils");
 require("dotenv").config();
 
 const app = express();
@@ -14,8 +15,10 @@ const databaseName = process.env.MONGODB_DATABASE || "nofluff";
 const model = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const maxWords = 500;
 const perPersonLimit = 5;
+const postReadyPerPersonLimit = 5;
 const totalDailyLimit = 100;
 const systemPrompt = fs.readFileSync(path.join(__dirname, "prompt.txt"), "utf8");
+const postReadyPrompt = fs.readFileSync(path.join(__dirname, "prompt-postready.txt"), "utf8");
 
 if (!mongoUri) {
   console.error("MONGODB_URI is missing. Add it to .env.");
@@ -88,16 +91,19 @@ function personKey(req) {
 async function readUsage(day, key) {
   const record = await usageCollection.findOne({ _id: day });
   const usedByPerson = record?.people?.[key] || 0;
+  const postReadyUsedByPerson = record?.postReadyPeople?.[key] || 0;
   const totalUsed = record?.total || 0;
   return {
     usedByPerson,
+    postReadyUsedByPerson,
     totalUsed,
     remaining: Math.max(0, perPersonLimit - usedByPerson),
+    postReadyRemaining: Math.max(0, postReadyPerPersonLimit - postReadyUsedByPerson),
     totalRemaining: Math.max(0, totalDailyLimit - totalUsed),
   };
 }
 
-async function reserveUsage(day, key) {
+async function reserveUsage(day, key, counter = "people", personLimit = perPersonLimit) {
   try {
     await usageCollection.updateOne(
       { _id: day },
@@ -108,14 +114,14 @@ async function reserveUsage(day, key) {
     if (error.code !== 11000) throw error;
   }
 
-  const personPath = `people.${key}`;
+  const personPath = `${counter}.${key}`;
   const result = await usageCollection.updateOne(
     {
       _id: day,
       total: { $lt: totalDailyLimit },
       $or: [
         { [personPath]: { $exists: false } },
-        { [personPath]: { $lt: perPersonLimit } },
+        { [personPath]: { $lt: personLimit } },
       ],
     },
     { $inc: { total: 1, [personPath]: 1 } },
@@ -124,8 +130,8 @@ async function reserveUsage(day, key) {
   return readUsage(day, key);
 }
 
-async function releaseUsage(day, key) {
-  const personPath = `people.${key}`;
+async function releaseUsage(day, key, counter = "people") {
+  const personPath = `${counter}.${key}`;
   await usageCollection.updateOne(
     { _id: day, [personPath]: { $gt: 0 }, total: { $gt: 0 } },
     { $inc: { total: -1, [personPath]: -1 } },
@@ -391,6 +397,104 @@ app.post("/api/rewrite", async (req, res) => {
     if (reserved) await releaseUsage(day, key).catch(() => {});
     console.error("Rewrite request failed:", error.name, error.code || "");
     return res.status(502).json({ error: "NoFluff couldn't finish that rewrite. Please try again." });
+  }
+});
+
+app.post("/api/post-ready", async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: "Sign in with Google to use Make post-ready." });
+  const text = typeof req.body?.text === "string" ? req.body.text : "";
+  if (!text.trim()) return res.status(400).json({ error: "Please choose some text first." });
+
+  const wordCount = text.split(/\s+/u).filter(Boolean).length;
+  if (wordCount > maxWords) {
+    return res.status(400).json({ error: `Please keep it to ${maxWords} words or fewer.` });
+  }
+  if (!process.env.GROQ_API_KEY) {
+    return res.status(503).json({ error: "Groq is not configured yet. Add GROQ_API_KEY to the backend .env file." });
+  }
+
+  const day = currentDayKey();
+  const key = personKey(req);
+  const counter = "postReadyPeople";
+  let reserved = false;
+  try {
+    const usage = await reserveUsage(day, key, counter, postReadyPerPersonLimit);
+    if (!usage) {
+      const current = await readUsage(day, key);
+      if (current.totalUsed >= totalDailyLimit) {
+        return res.status(429).json({ error: "NoFluff has reached today's total limit. Please try again tomorrow." });
+      }
+      return res.status(429).json({ error: "You've used today's 5 requests. They reset tomorrow." });
+    }
+    reserved = true;
+
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0,
+        max_completion_tokens: 1600,
+        messages: [
+          { role: "system", content: postReadyPrompt },
+          { role: "user", content: `<text>\n${text}\n</text>` },
+        ],
+      }),
+      signal: AbortSignal.timeout(45000),
+    });
+
+    if (!response.ok) {
+      console.error("Groq post-ready request failed with HTTP status:", response.status);
+      await releaseUsage(day, key, counter);
+      reserved = false;
+      const status = response.status === 429 ? 429 : response.status === 401 ? 503 : 502;
+      const error = response.status === 429
+        ? "Groq is busy or its current limit was reached. Please try again shortly."
+        : response.status === 401
+          ? "NoFluff's Groq API key was rejected. Check GROQ_API_KEY in the backend .env file."
+          : "NoFluff couldn't format this one. Please try again.";
+      return res.status(status).json({ error });
+    }
+
+    const data = await response.json();
+    const tokenUsage = {
+      promptTokens: data.usage?.prompt_tokens ?? 0,
+      completionTokens: data.usage?.completion_tokens ?? 0,
+      totalTokens: data.usage?.total_tokens ?? 0,
+    };
+    console.log("Groq post-ready token usage:", JSON.stringify({ model, ...tokenUsage }));
+
+    const raw = data.choices?.[0]?.message?.content;
+    if (typeof raw !== "string" || !raw.trim()) {
+      return res.status(502).json({ error: "No formatted text came back. Please try again." });
+    }
+
+    const validation = validatePostReadyText(text, raw.trim());
+    if (!validation.formatted) {
+      const latestUsage = await readUsage(day, key);
+      reserved = false;
+      return res.json({
+        ...validation,
+        remaining: latestUsage.postReadyRemaining,
+        totalRemaining: latestUsage.totalRemaining,
+      });
+    }
+
+    const latestUsage = await readUsage(day, key);
+    reserved = false;
+    return res.json({
+      ...validation,
+      remaining: latestUsage.postReadyRemaining,
+      totalRemaining: latestUsage.totalRemaining,
+      ...tokenUsage,
+    });
+  } catch (error) {
+    if (reserved) await releaseUsage(day, key, counter).catch(() => {});
+    console.error("Post-ready request failed:", error.name, error.code || "");
+    return res.status(502).json({ error: "NoFluff couldn't format this one. Please try again." });
   }
 });
 
