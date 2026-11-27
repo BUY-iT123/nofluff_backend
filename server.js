@@ -37,6 +37,8 @@ const googleVerifier = new OAuth2Client();
 let usageCollection;
 let usersCollection;
 let projectsCollection;
+let feedbackCollection;
+let remindersCollection;
 
 function readSession(req) {
   const cookie = req.headers.cookie?.split(";").map((part) => part.trim()).find((part) => part.startsWith("nofluff_session="));
@@ -213,6 +215,84 @@ app.post("/api/auth/google", async (req, res) => {
 });
 
 app.use(attachOptionalUser);
+
+app.get("/api/feedback/status", async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: "Sign in to share feedback." });
+  try {
+    const saved = await feedbackCollection.findOne({ ownerId: new ObjectId(req.user.id) }, { projection: { _id: 1 } });
+    return res.json({ eligible: !saved });
+  } catch (error) {
+    console.error("Could not read feedback status:", error.name);
+    return res.status(503).json({ error: "Feedback is temporarily unavailable." });
+  }
+});
+
+app.post("/api/feedback", async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: "Sign in to share feedback." });
+  const reaction = req.body?.reaction;
+  if (!["sad", "angry", "like", "happy"].includes(reaction)) return res.status(400).json({ error: "Choose one feedback reaction." });
+  try {
+    await feedbackCollection.insertOne({ ownerId: new ObjectId(req.user.id), reaction, createdAt: new Date() });
+    return res.status(201).json({ saved: true });
+  } catch (error) {
+    if (error.code === 11000) return res.status(409).json({ error: "Your feedback has already been saved." });
+    console.error("Could not save feedback:", error.name);
+    return res.status(503).json({ error: "Your feedback could not be saved. Please try again." });
+  }
+});
+
+app.post("/api/reminders", async (req, res) => {
+  if (!req.user) return res.status(401).json({ error: "Sign in to save a reminder schedule." });
+  const weeks = Number(req.body?.weeks);
+  const allowedDays = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+  const days = Array.isArray(req.body?.days) ? [...new Set(req.body.days)] : [];
+  const time = typeof req.body?.time === "string" ? req.body.time : "";
+  const timeZone = typeof req.body?.timeZone === "string" ? req.body.timeZone : "";
+  const backup = req.body?.backup;
+  if (![1, 2, 3].includes(weeks)) return res.status(400).json({ error: "Choose 1, 2, or 3 weeks." });
+  if (!days.length || days.some((day) => !allowedDays.includes(day))) return res.status(400).json({ error: "Choose at least one posting day." });
+  if (!/^(?:0[89]|1\d|2[01]):(?:00|15|30|45)$|^22:00$/.test(time)) return res.status(400).json({ error: "Choose a time from 8:00 AM to 10:00 PM." });
+  if (!timeZone || timeZone.length > 80) return res.status(400).json({ error: "Choose a valid time zone." });
+  try { new Intl.DateTimeFormat("en-US", { timeZone }).format(new Date()); } catch { return res.status(400).json({ error: "Choose a valid time zone." }); }
+
+  let backupContact = null;
+  if (backup != null) {
+    if (!backup || !["linkedin", "whatsapp"].includes(backup.type) || typeof backup.value !== "string") return res.status(400).json({ error: "Check the backup contact." });
+    const value = backup.value.trim();
+    if (!value || value.length > 300) return res.status(400).json({ error: "Enter the backup contact." });
+    if (backup.type === "linkedin") {
+      try {
+        const profile = new URL(value);
+        if (profile.protocol !== "https:" || !/(^|\.)linkedin\.com$/i.test(profile.hostname) || !profile.pathname.startsWith("/in/")) throw new Error("invalid profile");
+      } catch { return res.status(400).json({ error: "Enter a LinkedIn profile link." }); }
+    } else if (!/^\+?[1-9][\d\s().-]{7,19}$/.test(value) || value.replace(/\D/g, "").length < 8 || value.replace(/\D/g, "").length > 15) {
+      return res.status(400).json({ error: "Enter a WhatsApp number with country code." });
+    }
+    backupContact = { type: backup.type, value };
+  }
+
+  try {
+    const ownerId = new ObjectId(req.user.id);
+    const user = await usersCollection.findOne({ _id: ownerId }, { projection: { email: 1 } });
+    if (!user?.email) return res.status(401).json({ error: "Your sign-in email could not be found. Please sign in again." });
+    const scheduleDates = buildReminderSchedule({ weeks, days, time, timeZone, now: new Date() });
+    if (!scheduleDates.length) return res.status(400).json({ error: "No selected posting days remain in that schedule." });
+    const now = new Date();
+    await remindersCollection.updateOne(
+      { ownerId },
+      {
+        $set: { ownerId, email: user.email, weeks, days, time, timeZone, backup: backupContact, scheduleDates, status: "active", updatedAt: now },
+        $setOnInsert: { createdAt: now },
+      },
+      { upsert: true },
+    );
+    return res.status(201).json({ saved: true, email: user.email });
+  } catch (error) {
+    console.error("Could not save reminder schedule:", error.name);
+    return res.status(503).json({ error: "Your schedule could not be saved. Please try again." });
+  }
+});
+
 
 app.get("/api/auth/me", async (req, res) => {
   if (!req.user) return res.status(401).json({ error: "You are not signed in." });
@@ -507,14 +587,51 @@ app.post("/api/post-ready", async (req, res) => {
   }
 });
 
+const reminderWeekdayNumbers = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+
+function getReminderLocalDate(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" })
+    .formatToParts(date).filter((part) => part.type !== "literal");
+  return Object.fromEntries(parts.map(({ type, value }) => [type, Number(value)]));
+}
+
+function reminderLocalTimeToUtc(year, month, day, hour, minute, timeZone) {
+  const target = Date.UTC(year, month - 1, day, hour, minute);
+  let guess = target;
+  const formatter = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  for (let index = 0; index < 3; index += 1) {
+    const parts = Object.fromEntries(formatter.formatToParts(new Date(guess))
+      .filter((part) => part.type !== "literal").map(({ type, value }) => [type, Number(value)]));
+    guess += target - Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute);
+  }
+  return new Date(guess);
+}
+
+function buildReminderSchedule({ weeks, days, time, timeZone, now }) {
+  const [hour, minute] = time.split(":").map(Number);
+  const selectedDays = new Set(days.map((day) => reminderWeekdayNumbers[day]));
+  const start = getReminderLocalDate(now, timeZone);
+  const schedule = [];
+  for (let offset = 0; offset < weeks * 7; offset += 1) {
+    const date = new Date(Date.UTC(start.year, start.month - 1, start.day + offset));
+    if (!selectedDays.has(date.getUTCDay())) continue;
+    const reminderAt = reminderLocalTimeToUtc(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate(), hour, minute, timeZone);
+    if (reminderAt > now) schedule.push(reminderAt);
+  }
+  return schedule;
+}
 async function start() {
   await client.connect();
   await client.db("admin").command({ ping: 1 });
   usageCollection = client.db(databaseName).collection("daily_usage");
   usersCollection = client.db(databaseName).collection("users");
   projectsCollection = client.db(databaseName).collection("projects");
+  feedbackCollection = client.db(databaseName).collection("rewrite_feedback");
+  remindersCollection = client.db(databaseName).collection("reminder_schedules");
   await usersCollection.createIndex({ googleId: 1 }, { unique: true, partialFilterExpression: { googleId: { $type: "string" } } });
   await projectsCollection.createIndex({ ownerId: 1, updatedAt: -1 });
+  await feedbackCollection.createIndex({ ownerId: 1 }, { unique: true });
+  await remindersCollection.createIndex({ ownerId: 1 }, { unique: true });
   app.listen(port, "0.0.0.0", () => {
     console.log(`NoFluff local API listening on http://127.0.0.1:${port}; MongoDB connected.`);
   });
