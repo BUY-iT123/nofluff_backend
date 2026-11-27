@@ -15,7 +15,6 @@ const databaseName = process.env.MONGODB_DATABASE || "nofluff";
 const model = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const maxWords = 500;
 const perPersonLimit = 5;
-const postReadyPerPersonLimit = 5;
 const totalDailyLimit = 100;
 const systemPrompt = fs.readFileSync(path.join(__dirname, "prompt.txt"), "utf8");
 const postReadyPrompt = fs.readFileSync(path.join(__dirname, "prompt-postready.txt"), "utf8");
@@ -90,15 +89,18 @@ function personKey(req) {
 
 async function readUsage(day, key) {
   const record = await usageCollection.findOne({ _id: day });
-  const usedByPerson = record?.people?.[key] || 0;
+  const rewriteUsedByPerson = record?.people?.[key] || 0;
   const postReadyUsedByPerson = record?.postReadyPeople?.[key] || 0;
+  const usedByPerson = rewriteUsedByPerson + postReadyUsedByPerson;
   const totalUsed = record?.total || 0;
+  const remaining = Math.max(0, perPersonLimit - usedByPerson);
   return {
     usedByPerson,
+    rewriteUsedByPerson,
     postReadyUsedByPerson,
     totalUsed,
-    remaining: Math.max(0, perPersonLimit - usedByPerson),
-    postReadyRemaining: Math.max(0, postReadyPerPersonLimit - postReadyUsedByPerson),
+    remaining,
+    postReadyRemaining: remaining,
     totalRemaining: Math.max(0, totalDailyLimit - totalUsed),
   };
 }
@@ -119,10 +121,17 @@ async function reserveUsage(day, key, counter = "people", personLimit = perPerso
     {
       _id: day,
       total: { $lt: totalDailyLimit },
-      $or: [
-        { [personPath]: { $exists: false } },
-        { [personPath]: { $lt: personLimit } },
-      ],
+      $expr: {
+        $lt: [
+          {
+            $add: [
+              { $ifNull: [`$people.${key}`, 0] },
+              { $ifNull: [`$postReadyPeople.${key}`, 0] },
+            ],
+          },
+          personLimit,
+        ],
+      },
     },
     { $inc: { total: 1, [personPath]: 1 } },
   );
@@ -418,7 +427,7 @@ app.post("/api/post-ready", async (req, res) => {
   const counter = "postReadyPeople";
   let reserved = false;
   try {
-    const usage = await reserveUsage(day, key, counter, postReadyPerPersonLimit);
+    const usage = await reserveUsage(day, key, counter, perPersonLimit);
     if (!usage) {
       const current = await readUsage(day, key);
       if (current.totalUsed >= totalDailyLimit) {
@@ -478,7 +487,7 @@ app.post("/api/post-ready", async (req, res) => {
       reserved = false;
       return res.json({
         ...validation,
-        remaining: latestUsage.postReadyRemaining,
+        remaining: latestUsage.remaining,
         totalRemaining: latestUsage.totalRemaining,
       });
     }
@@ -487,7 +496,7 @@ app.post("/api/post-ready", async (req, res) => {
     reserved = false;
     return res.json({
       ...validation,
-      remaining: latestUsage.postReadyRemaining,
+      remaining: latestUsage.remaining,
       totalRemaining: latestUsage.totalRemaining,
       ...tokenUsage,
     });
